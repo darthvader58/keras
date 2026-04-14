@@ -4,6 +4,7 @@ import openvino.opset15 as ov_opset
 from openvino import Type
 
 from keras.src.backend import config
+from keras.src.backend.common import KerasVariable
 from keras.src.backend.common import dtypes
 from keras.src.backend.common.backend_utils import canonicalize_axis
 from keras.src.backend.common.variables import standardize_dtype
@@ -243,7 +244,7 @@ def all(x, axis=None, keepdims=False):
     )
 
 
-def allclose(x1, x2, rtol=1e-05, atol=1e-08, equal_nan=False):
+def allclose(x1, x2, rtol=1e-5, atol=1e-8, equal_nan=False):
     if (
         not isinstance(x1, OpenVINOKerasTensor)
         and not isinstance(x2, OpenVINOKerasTensor)
@@ -356,6 +357,31 @@ def append(x1, x2, axis=None):
 
 
 def arange(start, stop=None, step=None, dtype=None):
+    # For concrete scalar inputs, delegate to NumPy directly (matches its
+    # semantics exactly). Only build a graph for symbolic inputs.
+    _symbolic_types = (OpenVINOKerasTensor, ov.Output, KerasVariable)
+    _is_symbolic = (
+        isinstance(start, _symbolic_types)
+        or isinstance(stop, _symbolic_types)
+        or isinstance(step, _symbolic_types)
+    )
+    if not _is_symbolic:
+        _start = 0 if stop is None else start
+        _stop = start if stop is None else stop
+        _step = 1 if step is None else step
+        keras_dtype = (
+            standardize_dtype(dtype)
+            if dtype is not None
+            else dtypes.result_type(
+                type(_start), type(_stop), type(_step), "int32"
+            )
+        )
+        return OpenVINOKerasTensor(
+            ov_opset.constant(
+                np.arange(_start, _stop, _step, dtype=keras_dtype)
+            ).output(0)
+        )
+
     if stop is None:
         start, stop = get_ov_output(0), get_ov_output(start)
     else:
@@ -1125,13 +1151,23 @@ def blackman(x):
     n_minus_1 = ov_opset.subtract(
         ov_opset.convert(x, Type.f64), ov_opset.constant(1.0, Type.f64)
     ).output(0)
-    angle_2pi = ov_opset.divide(ov_opset.multiply(two_pi, n), n_minus_1)
+    n_minus_1_safe = ov_opset.select(
+        ov_opset.equal(n_minus_1, ov_opset.constant(0.0, Type.f64)),
+        ov_opset.constant(1.0, Type.f64),
+        n_minus_1,
+    ).output(0)
+    angle_2pi = ov_opset.divide(ov_opset.multiply(two_pi, n), n_minus_1_safe)
     angle_4pi = ov_opset.multiply(angle_2pi, ov_opset.constant(2.0, Type.f64))
     cos_2pi = ov_opset.cos(angle_2pi)
     cos_4pi = ov_opset.cos(angle_4pi)
     term_2_final = ov_opset.multiply(term_2, cos_2pi)
     term_3_final = ov_opset.multiply(term_3, cos_4pi)
     window = ov_opset.add(ov_opset.subtract(term_1, term_2_final), term_3_final)
+    window = ov_opset.select(
+        ov_opset.equal(n_minus_1, ov_opset.constant(0.0, Type.f64)),
+        ov_opset.constant(1.0, Type.f64),
+        window,
+    ).output(0)
     window = ov_opset.convert(window, OPENVINO_DTYPES[config.floatx()]).output(
         0
     )
@@ -1995,8 +2031,16 @@ def full_like(x, fill_value, dtype=None):
         ov_type = OPENVINO_DTYPES[standardize_dtype(dtype)]
     else:
         ov_type = x.get_element_type()
-    const_value = ov_opset.constant(fill_value, ov_type).output(0)
-    res = ov_opset.broadcast(const_value, shape_x).output(0)
+    fill_ov = get_ov_output(fill_value, ov_type)
+    if fill_ov.get_element_type() != ov_type:
+        fill_ov = ov_opset.convert(fill_ov, ov_type).output(0)
+    if (
+        isinstance(fill_value, (OpenVINOKerasTensor, ov.Output))
+        and len(fill_ov.get_partial_shape()) != 0
+    ):
+        scalar_shape = ov_opset.constant([], Type.i32).output(0)
+        fill_ov = ov_opset.reshape(fill_ov, scalar_shape, False).output(0)
+    res = ov_opset.broadcast(fill_ov, shape_x).output(0)
     return OpenVINOKerasTensor(res)
 
 
@@ -3231,6 +3275,12 @@ def nanmean(x, axis=None, keepdims=False):
     return OpenVINOKerasTensor(result)
 
 
+def nanmedian(x, axis=None, keepdims=False):
+    raise NotImplementedError(
+        "`nanmedian` is not supported with openvino backend"
+    )
+
+
 def nanmin(x, axis=None, keepdims=False):
     if isinstance(x, np.ndarray) and x.dtype == np.float64:
         # conversion to f32 due to https://github.com/openvinotoolkit/openvino/issues/34138
@@ -3619,9 +3669,14 @@ def nan_to_num(x, nan=0.0, posinf=None, neginf=None):
 
 def ndim(x):
     x = get_ov_output(x)
-    shape_tensor = ov_opset.shape_of(x, Type.i64).output(0)
-    rank_tensor = ov_opset.shape_of(shape_tensor, Type.i64).output(0)
-    return OpenVINOKerasTensor(rank_tensor)
+    rank = x.get_partial_shape().rank
+    if not rank.is_static:
+        raise ValueError(
+            "Cannot determine `ndim`: tensor has a dynamically-ranked "
+            "PartialShape. The OpenVINO backend requires a statically-known "
+            "rank for this operation."
+        )
+    return rank.get_length()
 
 
 def nonzero(x):
@@ -3959,6 +4014,31 @@ def reshape(x, newshape):
     elif isinstance(newshape, tuple):
         newshape = list(newshape)
     if isinstance(newshape, list):
+        has_dyn = False
+        for _d in newshape:
+            if isinstance(_d, OpenVINOKerasTensor):
+                has_dyn = True
+                break
+        if has_dyn:
+            # Build a shape tensor from mixed static/dynamic dims
+            axis = ov_opset.constant(0, Type.i32).output(0)
+            dim_tensors = []
+            for d in newshape:
+                if isinstance(d, OpenVINOKerasTensor):
+                    d_ov = get_ov_output(d)
+                    rank = d_ov.get_partial_shape().rank
+                    if rank.is_static and rank.get_length() == 0:
+                        d_ov = ov_opset.unsqueeze(d_ov, axis).output(0)
+                    dim_tensors.append(d_ov)
+                else:
+                    val = -1 if d is None else d
+                    dim_tensors.append(
+                        ov_opset.constant([val], Type.i32).output(0)
+                    )
+            newshape = ov_opset.concat(dim_tensors, 0).output(0)
+            return OpenVINOKerasTensor(
+                ov_opset.reshape(x, newshape, False).output(0)
+            )
         newshape = [-1 if d is None else d for d in newshape]
     if isinstance(newshape, OpenVINOKerasTensor):
         newshape = get_ov_output(newshape)
@@ -4632,6 +4712,8 @@ def vectorize(pyfunc, *, excluded=None, signature=None):
 
 def where(condition, x1=None, x2=None):
     condition = get_ov_output(condition)
+    if condition.get_element_type() != Type.boolean:
+        condition = ov_opset.convert(condition, Type.boolean).output(0)
     if x1 is None and x2 is None:
         nonzero_indices = ov_opset.non_zero(condition)
         return OpenVINOKerasTensor(nonzero_indices.output(0))
@@ -5018,11 +5100,25 @@ def eye(N, M=None, k=0, dtype=None):
     ov_type = OPENVINO_DTYPES[dtype]
     if M is None:
         M = N
+
+    def _to_dim_tensor(val):
+        if isinstance(val, (OpenVINOKerasTensor, ov.Output)):
+            val_ov = get_ov_output(val)
+            if val_ov.get_element_type() != Type.i32:
+                val_ov = ov_opset.convert(val_ov, Type.i32).output(0)
+            return ov_opset.reshape(
+                val_ov, ov_opset.constant([1], Type.i32).output(0), False
+            ).output(0)
+        return ov_opset.constant([val], Type.i32).output(0)
+
+    N_ov = _to_dim_tensor(N)
+    M_ov = _to_dim_tensor(M)
+    k_ov = ov_opset.constant(k, Type.i32).output(0)
     return OpenVINOKerasTensor(
         ov_opset.eye(
-            ov_opset.constant(N, Type.i32),
-            ov_opset.constant(M, Type.i32),
-            ov_opset.constant(k, Type.i32),
+            N_ov,
+            M_ov,
+            k_ov,
             output_type=ov_type,
         ).output(0)
     )
@@ -5502,3 +5598,260 @@ def histogram(x, bins=10, range=None):
     )
 
     return OpenVINOKerasTensor(hist.output(0)), OpenVINOKerasTensor(bin_edges)
+
+
+def unique(
+    x,
+    sorted=True,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    x = get_ov_output(x)
+    # OpenVINO Unique with sorted=False may produce unstable values on CPU.
+    # Keep outputs deterministic and correct by always requesting sorted values.
+    ov_sorted = True
+    x_shape = ov_opset.shape_of(x, Type.i32).output(0)
+    x_rank = x.get_partial_shape().rank.get_length()
+
+    if axis is None:
+        x_flat = ov_opset.reshape(
+            x, ov_opset.constant([-1], Type.i32).output(0), False
+        ).output(0)
+        x_flat_pshape = x_flat.get_partial_shape()
+        if (
+            x_flat_pshape.rank.is_static
+            and x_flat_pshape[0].is_static
+            and x_flat_pshape[0].get_length() == 0
+        ):
+            values = x_flat
+            inverse = ov_opset.constant(np.array([], dtype=np.int32)).output(0)
+            counts = ov_opset.constant(np.array([], dtype=np.int32)).output(0)
+            dim = 0
+        else:
+            x_type = x_flat.get_element_type()
+
+            if x_type.is_real():
+                nan_mask = ov_opset.not_equal(x_flat, x_flat).output(0)
+                n = ov_opset.squeeze(
+                    ov_opset.shape_of(x_flat, Type.i32).output(0),
+                    ov_opset.constant([0], Type.i32).output(0),
+                ).output(0)
+                idx = ov_opset.range(
+                    ov_opset.constant(0, Type.i32).output(0),
+                    n,
+                    ov_opset.constant(1, Type.i32).output(0),
+                    output_type=Type.i32,
+                ).output(0)
+                idx_as_x = ov_opset.convert(idx, x_type).output(0)
+
+                payload = ov_opset.select(nan_mask, idx_as_x, x_flat).output(0)
+                nan_tag = ov_opset.convert(nan_mask, x_type).output(0)
+                rows = ov_opset.concat(
+                    [
+                        ov_opset.unsqueeze(
+                            nan_tag,
+                            ov_opset.constant([1], Type.i32).output(0),
+                        ).output(0),
+                        ov_opset.unsqueeze(
+                            payload,
+                            ov_opset.constant([1], Type.i32).output(0),
+                        ).output(0),
+                    ],
+                    axis=1,
+                ).output(0)
+
+                uniq = ov_opset.unique(
+                    rows,
+                    axis=ov_opset.constant(0, Type.i32).output(0),
+                    sorted=ov_sorted,
+                    index_element_type="i32",
+                    count_element_type="i32",
+                )
+                uniq_rows = uniq.output(0)
+                inverse = uniq.output(2)
+                counts = uniq.output(3)
+
+                uniq_nan_tag = ov_opset.squeeze(
+                    ov_opset.gather(
+                        uniq_rows,
+                        ov_opset.constant([0], Type.i32).output(0),
+                        ov_opset.constant(1, Type.i32).output(0),
+                    ).output(0),
+                    ov_opset.constant([1], Type.i32).output(0),
+                ).output(0)
+                uniq_payload = ov_opset.squeeze(
+                    ov_opset.gather(
+                        uniq_rows,
+                        ov_opset.constant([1], Type.i32).output(0),
+                        ov_opset.constant(1, Type.i32).output(0),
+                    ).output(0),
+                    ov_opset.constant([1], Type.i32).output(0),
+                ).output(0)
+
+                nan_mask_u = ov_opset.convert(
+                    uniq_nan_tag, Type.boolean
+                ).output(0)
+                nan_const = ov_opset.constant(np.nan, x_type).output(0)
+                values = ov_opset.select(
+                    nan_mask_u, nan_const, uniq_payload
+                ).output(0)
+            else:
+                uniq = ov_opset.unique(
+                    x_flat,
+                    sorted=ov_sorted,
+                    index_element_type="i32",
+                    count_element_type="i32",
+                )
+                values = uniq.output(0)
+                inverse = uniq.output(2)
+                counts = uniq.output(3)
+            dim = 0
+    else:
+        dim = axis + x_rank if axis < 0 else axis
+        axis_node = ov_opset.constant(dim, Type.i32).output(0)
+        dim_len_is_zero = False
+        x_pshape = x.get_partial_shape()
+        if (
+            x_pshape.rank.is_static
+            and x_pshape[dim].is_static
+            and x_pshape[dim].get_length() == 0
+        ):
+            dim_len_is_zero = True
+        if dim_len_is_zero:
+            values = x
+            inverse = ov_opset.constant(np.array([], dtype=np.int32)).output(0)
+            counts = ov_opset.constant(np.array([], dtype=np.int32)).output(0)
+        else:
+            uniq = ov_opset.unique(
+                x,
+                axis=axis_node,
+                sorted=ov_sorted,
+                index_element_type="i32",
+                count_element_type="i32",
+            )
+            values = uniq.output(0)
+            inverse = uniq.output(2)
+            counts = uniq.output(3)
+
+    if size is not None:
+        values_shape = ov_opset.shape_of(values, Type.i32).output(0)
+        values_count = ov_opset.squeeze(
+            ov_opset.gather(
+                values_shape,
+                ov_opset.constant([dim], Type.i32).output(0),
+                ov_opset.constant(0, Type.i32).output(0),
+            ).output(0),
+            ov_opset.constant([0], Type.i32).output(0),
+        ).output(0)
+
+        size_node = ov_opset.constant(size, Type.i32).output(0)
+        trunc_size = ov_opset.minimum(values_count, size_node).output(0)
+
+        trunc_idx = ov_opset.range(
+            ov_opset.constant(0, Type.i32).output(0),
+            trunc_size,
+            ov_opset.constant(1, Type.i32).output(0),
+            output_type=Type.i32,
+        ).output(0)
+        values = ov_opset.gather(
+            values,
+            trunc_idx,
+            ov_opset.constant(dim, Type.i32).output(0),
+        ).output(0)
+
+        pad_amount = ov_opset.maximum(
+            ov_opset.subtract(size_node, values_count).output(0),
+            ov_opset.constant(0, Type.i32).output(0),
+        ).output(0)
+
+        if dim == 0:
+            values_shape_after_trunc = ov_opset.shape_of(
+                values, Type.i32
+            ).output(0)
+            tail_shape = ov_opset.slice(
+                values_shape_after_trunc,
+                ov_opset.constant([1], Type.i32).output(0),
+                ov_opset.constant([2**31 - 1], Type.i32).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+            ).output(0)
+            pad_shape = ov_opset.concat(
+                [
+                    ov_opset.unsqueeze(
+                        pad_amount,
+                        ov_opset.constant([0], Type.i32).output(0),
+                    ).output(0),
+                    tail_shape,
+                ],
+                axis=0,
+            ).output(0)
+            fill = 0 if fill_value is None else fill_value
+            fill_node = get_ov_output(fill, values.get_element_type())
+            pad_block = ov_opset.broadcast(fill_node, pad_shape).output(0)
+            values = ov_opset.concat([values, pad_block], axis=0).output(0)
+        else:
+            perm = [dim] + [i for i in range(x_rank) if i != dim]
+            inv_perm = [0] * x_rank
+            for i, p in enumerate(perm):
+                inv_perm[p] = i
+
+            values_t = ov_opset.transpose(
+                values,
+                ov_opset.constant(perm, Type.i32).output(0),
+            ).output(0)
+            values_t_shape = ov_opset.shape_of(values_t, Type.i32).output(0)
+            tail_shape = ov_opset.slice(
+                values_t_shape,
+                ov_opset.constant([1], Type.i32).output(0),
+                ov_opset.constant([2**31 - 1], Type.i32).output(0),
+                ov_opset.constant([1], Type.i32).output(0),
+            ).output(0)
+            pad_shape = ov_opset.concat(
+                [
+                    ov_opset.unsqueeze(
+                        pad_amount,
+                        ov_opset.constant([0], Type.i32).output(0),
+                    ).output(0),
+                    tail_shape,
+                ],
+                axis=0,
+            ).output(0)
+            fill = 0 if fill_value is None else fill_value
+            fill_node = get_ov_output(fill, values_t.get_element_type())
+            pad_block = ov_opset.broadcast(fill_node, pad_shape).output(0)
+            values_t = ov_opset.concat([values_t, pad_block], axis=0).output(0)
+            values = ov_opset.transpose(
+                values_t,
+                ov_opset.constant(inv_perm, Type.i32).output(0),
+            ).output(0)
+
+        if return_counts:
+            counts = ov_opset.gather(
+                counts,
+                trunc_idx,
+                ov_opset.constant(0, Type.i32).output(0),
+            ).output(0)
+            zero_counts = ov_opset.constant(
+                0, counts.get_element_type()
+            ).output(0)
+            counts_pad = ov_opset.broadcast(
+                zero_counts,
+                ov_opset.unsqueeze(
+                    pad_amount,
+                    ov_opset.constant([0], Type.i32).output(0),
+                ).output(0),
+            ).output(0)
+            counts = ov_opset.concat([counts, counts_pad], axis=0).output(0)
+
+    if return_inverse and axis is None:
+        inverse = ov_opset.reshape(inverse, x_shape, False).output(0)
+
+    outputs = [OpenVINOKerasTensor(values)]
+    if return_inverse:
+        outputs.append(OpenVINOKerasTensor(inverse))
+    if return_counts:
+        outputs.append(OpenVINOKerasTensor(counts))
+
+    return outputs[0] if len(outputs) == 1 else tuple(outputs)

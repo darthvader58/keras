@@ -262,6 +262,7 @@ from keras.src.ops.numpy import nancumprod as nancumprod
 from keras.src.ops.numpy import nancumsum as nancumsum
 from keras.src.ops.numpy import nanmax as nanmax
 from keras.src.ops.numpy import nanmean as nanmean
+from keras.src.ops.numpy import nanmedian as nanmedian
 from keras.src.ops.numpy import nanmin as nanmin
 from keras.src.ops.numpy import nanprod as nanprod
 from keras.src.ops.numpy import nanquantile as nanquantile
@@ -324,6 +325,7 @@ from keras.src.ops.numpy import tril as tril
 from keras.src.ops.numpy import triu as triu
 from keras.src.ops.numpy import true_divide as true_divide
 from keras.src.ops.numpy import trunc as trunc
+from keras.src.ops.numpy import unique as unique
 from keras.src.ops.numpy import unravel_index as unravel_index
 from keras.src.ops.numpy import vander as vander
 from keras.src.ops.numpy import var as var

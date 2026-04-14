@@ -12,8 +12,8 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
 
 jobs:
 
@@ -26,6 +26,8 @@ jobs:
 
     name: ${{ format('Run tests on {0}TPU', matrix.multi_device && 'multi-' || '') }}
     runs-on: ${{ matrix.multi_device && 'linux-x86-ct5lp-112-4tpu' || 'linux-x86-ct6e-44-1tpu' }}
+    timeout-minutes: 120
+
     # Only run on pushes to master, releases or "kokoro:force-run" unlabel
     if: |
       github.event_name == 'push' ||
@@ -38,7 +40,7 @@ jobs:
 
     steps:
       - name: Checkout ${{ github.ref }}
-        uses: actions/checkout@v6.0.2
+        uses: actions/checkout@v6
       
       - name: Install Dependencies
         run: pip install --no-cache-dir -r requirements-${{ matrix.backend }}-tpu.txt

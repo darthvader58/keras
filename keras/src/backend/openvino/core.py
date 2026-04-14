@@ -2,6 +2,7 @@ import builtins
 import contextlib
 import warnings
 
+import ml_dtypes
 import numpy as np
 import openvino as ov
 import openvino.opset15 as ov_opset
@@ -96,17 +97,31 @@ def align_operand_types(x1, x2, op_name):
 
 # create ov.Output (symbolic OpenVINO tensor)
 # for different input `x`
-def get_ov_output(x, ov_type=None):
+def get_ov_output(x, ov_type=None, context_dtype=None):
+    if (
+        isinstance(x, (float, int))
+        and ov_type is None
+        and context_dtype is not None
+    ):
+        ov_type = OPENVINO_DTYPES[dtypes.result_type(context_dtype, type(x))]
     if isinstance(x, float):
         if ov_type is None:
             ov_type = Type.f32
-        x = ov_opset.constant(x, ov_type).output(0)
+        if ov_type == Type.bf16:
+            x = ov_opset.constant(x, Type.f32).output(0)
+            x = ov_opset.convert(x, Type.bf16).output(0)
+        else:
+            x = ov_opset.constant(x, ov_type).output(0)
     elif isinstance(x, int):
         if ov_type is None:
             ov_type = Type.i32
-        x = ov_opset.constant(x, ov_type).output(0)
+        if ov_type == Type.bf16:
+            x = ov_opset.constant(float(x), Type.f32).output(0)
+            x = ov_opset.convert(x, Type.bf16).output(0)
+        else:
+            x = ov_opset.constant(x, ov_type).output(0)
     elif isinstance(x, np.ndarray):
-        if x.dtype == np.dtype("bfloat16"):
+        if x.dtype == "bfloat16":
             x = ov_opset.constant(x, OPENVINO_DTYPES["bfloat16"]).output(0)
         else:
             x = ov_opset.constant(x).output(0)
@@ -164,7 +179,7 @@ class OpenVINOKerasTensor:
 
     def __add__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__add__"
         )
@@ -172,7 +187,7 @@ class OpenVINOKerasTensor:
 
     def __radd__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__radd__"
         )
@@ -180,7 +195,7 @@ class OpenVINOKerasTensor:
 
     def __sub__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__sub__"
         )
@@ -192,7 +207,7 @@ class OpenVINOKerasTensor:
 
     def __rsub__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__rsub__"
         )
@@ -200,7 +215,7 @@ class OpenVINOKerasTensor:
 
     def __mul__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__mul__"
         )
@@ -212,7 +227,7 @@ class OpenVINOKerasTensor:
 
     def __rmul__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__rmul__"
         )
@@ -224,7 +239,7 @@ class OpenVINOKerasTensor:
 
     def __truediv__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__truediv__"
         )
@@ -232,7 +247,7 @@ class OpenVINOKerasTensor:
 
     def __rtruediv__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__rtruediv__"
         )
@@ -240,19 +255,33 @@ class OpenVINOKerasTensor:
 
     def __floordiv__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__floordiv__"
         )
-        return OpenVINOKerasTensor(ov_opset.divide(first, other).output(0))
+        div = ov_opset.divide(first, other).output(0)
+        div_type = div.get_element_type()
+        if div_type.is_integral():
+            div = ov_opset.convert(div, Type.f32).output(0)
+            div = ov_opset.floor(div).output(0)
+            div = ov_opset.convert(div, div_type).output(0)
+            return OpenVINOKerasTensor(div)
+        return OpenVINOKerasTensor(ov_opset.floor(div).output(0))
 
     def __rfloordiv__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__rfloordiv__"
         )
-        return OpenVINOKerasTensor(ov_opset.divide(other, first).output(0))
+        div = ov_opset.divide(other, first).output(0)
+        div_type = div.get_element_type()
+        if div_type.is_integral():
+            div = ov_opset.convert(div, Type.f32).output(0)
+            div = ov_opset.floor(div).output(0)
+            div = ov_opset.convert(div, div_type).output(0)
+            return OpenVINOKerasTensor(div)
+        return OpenVINOKerasTensor(ov_opset.floor(div).output(0))
 
     def __neg__(self):
         first = self.output
@@ -268,14 +297,14 @@ class OpenVINOKerasTensor:
 
     def __pow__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__pow__"
         )
         return OpenVINOKerasTensor(ov_opset.power(first, other).output(0))
 
     def __rpow__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__rpow__"
@@ -284,7 +313,7 @@ class OpenVINOKerasTensor:
 
     def __lt__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__lt__"
         )
@@ -292,7 +321,7 @@ class OpenVINOKerasTensor:
 
     def __gt__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__gt__"
         )
@@ -300,7 +329,7 @@ class OpenVINOKerasTensor:
 
     def __le__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__le__"
         )
@@ -308,7 +337,7 @@ class OpenVINOKerasTensor:
 
     def __ge__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__ge__"
         )
@@ -318,7 +347,7 @@ class OpenVINOKerasTensor:
 
     def __eq__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__eq__"
         )
@@ -326,7 +355,7 @@ class OpenVINOKerasTensor:
 
     def __ne__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__ne__"
         )
@@ -393,9 +422,17 @@ class OpenVINOKerasTensor:
                 axes.append(dim)
                 gather_indices_nodes.append(idx_value.output(0))
             elif isinstance(index, builtins.slice):
-                if index == builtins.slice(None):
+                if (
+                    index.start is None
+                    and index.stop is None
+                    and index.step is None
+                ):
                     continue
-                if index.step is not None and index.step < 0:
+                if (
+                    index.step is not None
+                    and not isinstance(index.step, OpenVINOKerasTensor)
+                    and index.step < 0
+                ):
                     raise ValueError("OpenVINO doesn't support negative steps")
                 slice_axes.append(dim)
                 slice_starts.append(0 if index.start is None else index.start)
@@ -440,9 +477,29 @@ class OpenVINOKerasTensor:
                 )
 
         if slice_axes:
-            step = ov_opset.constant(slice_steps, Type.i32).output(0)
-            start = ov_opset.constant(slice_starts, Type.i32).output(0)
-            stop = ov_opset.constant(slice_ends, Type.i32).output(0)
+
+            def _to_slice_bound(values, dtype=Type.i32):
+                nodes = []
+                for v in values:
+                    if isinstance(v, OpenVINOKerasTensor):
+                        node = v.output
+                    else:
+                        node = ov_opset.constant([v], dtype).output(0)
+                    if node.get_element_type() != dtype:
+                        node = ov_opset.convert(node, dtype).output(0)
+                    ps = node.get_partial_shape()
+                    if len(ps) == 0:
+                        node = ov_opset.unsqueeze(
+                            node, ov_opset.constant(0, Type.i32)
+                        ).output(0)
+                    nodes.append(node)
+                if len(nodes) == 1:
+                    return nodes[0]
+                return ov_opset.concat(nodes, axis=0).output(0)
+
+            step = _to_slice_bound(slice_steps)
+            start = _to_slice_bound(slice_starts)
+            stop = _to_slice_bound(slice_ends)
             adjusted_slice_axes = [
                 ax - sum(1 for unsq in unsqueeze_axes if unsq <= ax)
                 for ax in slice_axes
@@ -517,7 +574,7 @@ class OpenVINOKerasTensor:
 
     def __mod__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__mod__"
         )
@@ -539,7 +596,7 @@ class OpenVINOKerasTensor:
         return self.__array__()
 
     def __rmod__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         other, first = align_operand_types(
             other, first, "OpenVINOKerasTensor::__rmod__"
@@ -548,7 +605,7 @@ class OpenVINOKerasTensor:
 
     def __matmul__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__matmul__"
         )
@@ -557,7 +614,7 @@ class OpenVINOKerasTensor:
         )
 
     def __rmatmul__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         other, first = align_operand_types(
             other, first, "OpenVINOKerasTensor::__rmatmul__"
@@ -574,14 +631,14 @@ class OpenVINOKerasTensor:
 
     def __and__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__and__"
         )
         return OpenVINOKerasTensor(ov_opset.logical_and(first, other).output(0))
 
     def __rand__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         other, first = align_operand_types(
             other, first, "OpenVINOKerasTensor::__rand__"
@@ -590,14 +647,14 @@ class OpenVINOKerasTensor:
 
     def __or__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__or__"
         )
         return OpenVINOKerasTensor(ov_opset.logical_or(first, other).output(0))
 
     def __ror__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         other, first = align_operand_types(
             other, first, "OpenVINOKerasTensor::__ror__"
@@ -606,14 +663,14 @@ class OpenVINOKerasTensor:
 
     def __xor__(self, other):
         first = self.output
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first, other = align_operand_types(
             first, other, "OpenVINOKerasTensor::__xor__"
         )
         return OpenVINOKerasTensor(ov_opset.logical_xor(first, other).output(0))
 
     def __rxor__(self, other):
-        other = get_ov_output(other)
+        other = get_ov_output(other, context_dtype=self.dtype)
         first = self.output
         other, first = align_operand_types(
             other, first, "OpenVINOKerasTensor::__rxor__"
@@ -824,20 +881,40 @@ def convert_to_numpy(x):
     try:
         node = x.output.get_node()
         if node.get_type_name() == "Constant":
-            return np.array(node.data)
+            data = node.data
+            # OpenVINO returns bf16 constant bytes as float16 (same width,
+            # but wrong dtype) because numpy has no native bfloat16 type.
+            # Re-interpret the raw bytes as ml_dtypes.bfloat16.
+            if node.output(0).get_element_type() == Type.bf16:
+                data = data.view(ml_dtypes.bfloat16)
+            return np.array(data)
     except Exception:
         # fall back to the slow path.
         pass
     try:
         ov_result = x.output
+        casted_from_bool = False
+        if ov_result.get_element_type() == Type.boolean:
+            ov_result = ov_opset.convert(ov_result, Type.i32).output(0)
+            casted_from_bool = True
         ov_model = Model(results=[ov_result], parameters=[])
-        ov_compiled_model = compile_model(ov_model, get_device())
+        ov_compiled_model = compile_model(
+            ov_model,
+            get_device(),
+            config={"INFERENCE_PRECISION_HINT": "f32"},
+        )
         result = ov_compiled_model({})[0]
+        if casted_from_bool:
+            result = result.astype(bool)
     except Exception as inner_exception:
         raise RuntimeError(
             "`convert_to_numpy` failed to convert the tensor."
         ) from inner_exception
-    return np.array(result)
+    data = np.array(result)
+    # Same byte-reinterpretation issue applies to inference results.
+    if x.dtype == "bfloat16" and data.dtype != ml_dtypes.bfloat16:
+        data = data.view(ml_dtypes.bfloat16)
+    return data
 
 
 def is_tensor(x):
@@ -849,7 +926,25 @@ def is_tensor(x):
 
 
 def shape(x):
-    return tuple(x.shape)
+    if not isinstance(x, OpenVINOKerasTensor):
+        return tuple(x.shape)
+
+    static_shape = x.shape
+    if static_shape is None or None not in static_shape:
+        return static_shape
+
+    # For dynamic dims, return OpenVINOKerasTensor scalars obtained at runtime
+    shape_node = ov_opset.shape_of(x.output, Type.i32).output(0)
+    axis = ov_opset.constant(0, Type.i32).output(0)
+    result = []
+    for i, dim in enumerate(static_shape):
+        if dim is None:
+            idx = ov_opset.constant(i, Type.i32).output(0)
+            dim_scalar = ov_opset.gather(shape_node, idx, axis).output(0)
+            result.append(OpenVINOKerasTensor(dim_scalar))
+        else:
+            result.append(dim)
+    return tuple(result)
 
 
 def cast(x, dtype):

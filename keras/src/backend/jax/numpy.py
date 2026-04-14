@@ -1105,6 +1105,11 @@ def nanmean(x, axis=None, keepdims=False):
     return jnp.nanmean(x, axis=axis, keepdims=keepdims)
 
 
+def nanmedian(x, axis=None, keepdims=False):
+    x = convert_to_tensor(x)
+    return jnp.nanmedian(x, axis=axis, keepdims=keepdims)
+
+
 def nanmin(x, axis=None, keepdims=False):
     x = convert_to_tensor(x)
     return jnp.nanmin(x, axis=axis, keepdims=keepdims)
@@ -1632,3 +1637,24 @@ def argpartition(x, kth, axis=-1):
 
 def histogram(x, bins=10, range=None):
     return jnp.histogram(x, bins=bins, range=range)
+
+
+def unique(
+    x,
+    sorted=True,
+    return_inverse=False,
+    return_counts=False,
+    axis=None,
+    size=None,
+    fill_value=None,
+):
+    return jnp.unique(
+        x,
+        return_inverse=return_inverse,
+        return_counts=return_counts,
+        axis=axis,
+        equal_nan=False,
+        size=size,
+        sorted=sorted,
+        fill_value=fill_value,
+    )
